@@ -1,110 +1,73 @@
 require('dotenv').config();
 
-const puppeteer = require('puppeteer');
+const { execSync } = require('child_process');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
 const fs = require('fs');
+const path = require('path');
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const daysmart_url = 'https://apps.daysmartrecreation.com/dash/x/#/online/chaparralice/calendar';
-const headlessBrowser = process.env.HEADLESS !== 'false'; // Set to false to see browser
+const browserMode = process.env.BROWSER_MODE || 'headless';
+const recordVideo = process.env.RECORD_VIDEO === 'true';
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 async function scrapeEvents() {
   console.log(`[${new Date().toISOString()}] Starting scrape...`);
   
-  let browser;
   try {
-    browser = await puppeteer.launch({
-      headless: headlessBrowser ? 'new' : false,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-
-    const page = await browser.newPage();
-    page.setDefaultTimeout(60000);
-    page.setDefaultNavigationTimeout(60000);
-
-    // Build URL with date range and filters
     const today = new Date().toISOString().split('T')[0];
     const in7days = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
     
-    // event_type=9 for "Hockey Drop In", location=1 for Chaparral Ice
     const url = `${daysmart_url}?start=${today}&end=${in7days}&event_type=9&location=1`;
 
     console.log(`Navigating to: ${url}`);
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
+    console.log(`Browser mode: ${browserMode}`);
 
-    // Wait for Angular to render the event list
-    await page.waitForTimeout(3000); // Extra wait for Angular rendering
+    let agentBrowserCmd = `agent-browser open "${url}"`;
     
-    // Try to find event cards
-    await page.waitForSelector('dash-event-list-group-item, a[href*="/teams/"]', { timeout: 10000 }).catch(() => {
-      console.log('Event selector not found, continuing anyway...');
-    });
+    if (browserMode === 'headed') {
+      agentBrowserCmd += ' --headed';
+    }
+    
+    if (recordVideo) {
+      const videoFile = path.join(process.cwd(), `scrape-${Date.now()}.webm`);
+      agentBrowserCmd += ` --record "${videoFile}"`;
+      console.log(`Recording video to: ${videoFile}`);
+    }
 
-    // Save the HTML for debugging
-    const html = await page.content();
-    fs.writeFileSync('page.html', html);
-    console.log('✓ Page HTML saved to page.html');
+    agentBrowserCmd += ' --wait 3000 --snapshot';
 
-    // Extract events from the page
-    const events = await page.evaluate(() => {
-      const results = [];
-      
-      // Find all event list items
-      const eventItems = document.querySelectorAll('dash-event-list-group-item, .list-group-item--app-item');
-      console.log(`Found ${eventItems.length} event items`);
-
-      eventItems.forEach((item) => {
-        const text = item.textContent || '';
-        
-        // Only capture "Hockey Drop In" / "Drop-in Player" events
-        if (!text.includes('Drop-in') && !text.includes('Hockey Drop In')) return;
-
-        // Extract title from link
-        const titleLink = item.querySelector('a[href*="/teams/"]');
-        const title = titleLink?.textContent?.trim() || '';
-        
-        // Extract time (e.g., "6:30am - 7:45am")
-        const timeEl = Array.from(item.querySelectorAll('div')).find(el => 
-          /\d{1,2}:\d{2}(am|pm)\s*-\s*\d{1,2}:\d{2}(am|pm)/i.test(el.textContent)
-        );
-        const timeText = timeEl?.textContent?.trim() || '';
-        
-        // Extract location
-        const locationEl = Array.from(item.querySelectorAll('span, div')).find(el =>
-          el.textContent.includes('Chaparral Ice')
-        );
-        const locationText = locationEl?.textContent?.trim() || '';
-
-        results.push({
-          title,
-          timeText,
-          locationText,
-          fullText: text
-        });
+    console.log(`Running: ${agentBrowserCmd}`);
+    let snapshotOutput;
+    
+    try {
+      snapshotOutput = execSync(agentBrowserCmd, { 
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: 10 * 1024 * 1024
       });
+    } catch (e) {
+      console.log('agent-browser output:', e.stdout || e.message);
+      snapshotOutput = e.stdout || '';
+    }
 
-      return results;
-    });
+    console.log('Parsing events from page...');
+    const events = parseEventsFromSnapshot(snapshotOutput);
 
     console.log(`Found ${events.length} Hockey Drop In events`);
     
     if (events.length === 0) {
-      console.log('No events found. Dumping page structure for debugging...');
-      const pageText = await page.evaluate(() => document.body.innerText);
-      console.log(pageText.substring(0, 1000));
+      console.log('No events found on page.');
     }
 
-    // Process and insert events into Supabase
     for (const event of events) {
-      const { title, timeText, locationText, fullText } = event;
+      const { title, timeText, fullText } = event;
 
       console.log(`Processing: ${title}`);
 
-      // Parse times from text like "6:30am - 7:45am"
       const timeMatch = fullText.match(/(\d{1,2}):(\d{2})(am|pm)\s*-\s*(\d{1,2}):(\d{2})(am|pm)/i);
       let startTime, endTime;
 
@@ -124,10 +87,9 @@ async function scrapeEvents() {
         endTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), end, parseInt(endMin));
       } else {
         startTime = new Date();
-        endTime = new Date(startTime.getTime() + 75 * 60000); // Default 75 min based on typical drop-in time
+        endTime = new Date(startTime.getTime() + 75 * 60000);
       }
 
-      // Find location_id in Supabase
       let locationId = null;
       try {
         const { data: locationData, error: locError } = await supabase
@@ -145,7 +107,6 @@ async function scrapeEvents() {
         console.log('Location exception:', err.message);
       }
 
-      // Find event_type_id
       let eventTypeId = null;
       try {
         const { data: eventTypeData, error: typeError } = await supabase
@@ -163,7 +124,6 @@ async function scrapeEvents() {
         console.log('Event type exception:', err.message);
       }
 
-      // Upsert event
       const externalId = `daysmart-${title.replace(/\s+/g, '-')}-${startTime.getTime()}`;
       
       const { error } = await supabase
@@ -191,23 +151,54 @@ async function scrapeEvents() {
       }
     }
 
-    await browser.close();
     console.log(`[${new Date().toISOString()}] Scrape completed`);
 
   } catch (error) {
     console.error('Scrape error:', error);
-    if (browser) await browser.close();
   }
 }
 
-// Run immediately on startup
+function parseEventsFromSnapshot(text) {
+  const events = [];
+  
+  // Look for patterns like "Adult Drop-in Player 4/28/26 6:30am"
+  // or "Adult Drop-in Goalie 4/28/26 6:30am" followed by time range
+  const eventRegex = /(Adult\s+Drop-in\s+\w+)\s+(\d{1,2}\/\d{1,2}\/\d{2})\s+(\d{1,2}:\d{2}(?:am|pm)?)/gi;
+  
+  let match;
+  while ((match = eventRegex.exec(text)) !== null) {
+    const [fullMatch, title, date, startTimeStr] = match;
+    
+    // Look ahead in the text for time range (e.g., "6:30am - 7:45am")
+    const nextChars = text.substring(match.index + fullMatch.length, match.index + fullMatch.length + 50);
+    const timeRangeMatch = nextChars.match(/(\d{1,2}:\d{2}(?:am|pm)?)\s*-\s*(\d{1,2}:\d{2}(?:am|pm)?)/i);
+    
+    let timeText = '';
+    if (timeRangeMatch) {
+      timeText = `${timeRangeMatch[1]} - ${timeRangeMatch[2]}`;
+    } else if (startTimeStr) {
+      // If we only have start time, estimate end time (75 min later)
+      timeText = startTimeStr;
+    }
+
+    events.push({
+      title: title.trim(),
+      date: date,
+      timeText: timeText,
+      fullText: `${title.trim()} ${date} ${timeText}`
+    });
+  }
+  
+  return events;
+}
+
 scrapeEvents();
 
-// Schedule to run every 6 hours
 cron.schedule('0 */6 * * *', () => {
   console.log('Cron triggered, starting scrape...');
   scrapeEvents();
 });
 
 console.log('Scraper started. Scheduled to run every 6 hours.');
-console.log(`Browser mode: ${headlessBrowser ? 'headless (hidden)' : 'visible (you can see it)'}`);
+console.log(`Browser mode: ${browserMode}`);
+console.log(`Video recording: ${recordVideo ? 'enabled' : 'disabled'}`);

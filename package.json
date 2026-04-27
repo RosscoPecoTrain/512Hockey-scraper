@@ -1,15 +1,16 @@
 {
   "name": "512hockey-scraper",
-  "version": "1.0.0",
-  "description": "Scrapes Hockey Drop In events from DaySmart and stores in Supabase",
+  "version": "2.0.0",
+  "description": "Scrapes Hockey Drop In events from DaySmart and stores in Supabase using agent-browser",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:headed": "BROWSER_MODE=headed node index.js",
+    "start:video": "BROWSER_MODE=headless RECORD_VIDEO=true node index.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.38.4",
     "dotenv": "^17.4.2",
-    "node-cron": "^4.2.1",
-    "puppeteer": "^24.42.0"
+    "node-cron": "^4.2.1"
   }
 }
