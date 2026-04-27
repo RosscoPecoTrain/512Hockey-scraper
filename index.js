@@ -32,12 +32,12 @@ async function scrapeEvents() {
     page.setDefaultTimeout(60000);
     page.setDefaultNavigationTimeout(60000);
 
-    // Build URL with date range and filters
+    // Build URL with date range
     const today = new Date().toISOString().split('T')[0];
     const in7days = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
     
-    // event_type=9 for "Hockey Drop In", location=1 for Chaparral Ice
-    const url = `${daysmart_url}?start=${today}&end=${in7days}&event_type=9&location=1`;
+    // Get all events (don't filter by event_type, filter in JS instead)
+    const url = `${daysmart_url}?start=${today}&end=${in7days}&location=1`;
 
     console.log(`Navigating to: ${url}`);
     await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
@@ -69,8 +69,8 @@ async function scrapeEvents() {
       eventItems.forEach((item) => {
         const text = item.textContent || '';
         
-        // Only capture "Hockey Drop In" / "Drop-in Player" events
-        if (!text.includes('Drop-in') && !text.includes('Hockey Drop In') && !text.includes('Adult Drop-In')) return;
+        // Only capture "Drop-In" events (case-insensitive)
+        if (!text.match(/drop.?in|adult drop/i)) return;
 
         // Extract title - look for it in various places
         let title = '';
@@ -107,7 +107,17 @@ async function scrapeEvents() {
         }
       });
 
-      console.log(`Extracted ${results.length} events`);
+      console.log(`Extracted ${results.length} Drop-In events`);
+      if (results.length === 0) {
+        console.log('No drop-in events found. All items found:');
+        eventItems.forEach((item, idx) => {
+          const text = item.textContent || '';
+          const title = text.split('\n')[0].trim();
+          if (title.length > 3) {
+            console.log(`  ${idx}: ${title}`);
+          }
+        });
+      }
       return results;
     });
 
