@@ -32,55 +32,136 @@ async function scrapeEvents() {
     console.log(`Navigating to: ${url}`);
     console.log(`Browser mode: ${browserMode}`);
 
-    let agentBrowserCmd = `agent-browser open "${url}"`;
+    // Step 1: Open the page
+    let openCmd = `agent-browser open "${url}"`;
     
     if (browserMode === 'headed') {
-      agentBrowserCmd += ' --headed';
+      openCmd += ' --headed';
     }
     
     if (recordVideo) {
       const videoFile = path.join(process.cwd(), `scrape-${Date.now()}.webm`);
-      agentBrowserCmd += ` --record "${videoFile}"`;
+      openCmd += ` --record "${videoFile}"`;
       console.log(`Recording video to: ${videoFile}`);
     }
 
-    agentBrowserCmd += ' --wait 3000 --snapshot';
+    openCmd += ' --wait 3000';
 
-    console.log(`Running: ${agentBrowserCmd}`);
-    let snapshotOutput;
-    
+    console.log(`Opening browser...`);
     try {
-      snapshotOutput = execSync(agentBrowserCmd, { 
+      execSync(openCmd, { 
         encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: 'pipe',
         maxBuffer: 10 * 1024 * 1024
       });
     } catch (e) {
-      console.log('⚠️  agent-browser error:', e.message);
-      snapshotOutput = e.stdout || '';
+      console.log('⚠️  agent-browser open error:', e.message);
     }
 
-    // Save snapshot for debugging
-    fs.writeFileSync('snapshot.txt', snapshotOutput);
-    console.log('✓ Snapshot saved to snapshot.txt');
+    // Step 2: Extract events using JavaScript evaluation
+    console.log('Extracting events via JavaScript...');
+    
+    const jsCode = `
+      const events = [];
+      
+      // Find all event elements - try multiple selectors
+      const eventItems = document.querySelectorAll(
+        'div[class*="event"], li[class*="event"], [role="listitem"], .calendar-event, .event-item'
+      );
+      
+      console.log('Found ' + eventItems.length + ' potential event items');
+      
+      eventItems.forEach((item) => {
+        const text = item.textContent || '';
+        
+        // Look for drop-in hockey events
+        if (!text.match(/drop.?in|hockey/i)) return;
+        
+        // Extract title
+        let title = '';
+        const titleEl = item.querySelector('strong, b, h3, h4, a');
+        if (titleEl) {
+          title = titleEl.textContent.trim();
+        } else {
+          title = text.split('\\n')[0].trim();
+        }
+        
+        // Extract time (e.g., "6:30 AM - 7:45 AM")
+        const timeMatch = text.match(/(\\d{1,2}):(\\d{2})\\s*(am|pm|AM|PM)\\s*-\\s*(\\d{1,2}):(\\d{2})\\s*(am|pm|AM|PM)/i);
+        if (!timeMatch) return; // Skip if no time found
+        
+        const timeText = timeMatch[0];
+        
+        if (title && title.length > 3) {
+          events.push({
+            title: title,
+            timeText: timeText,
+            fullText: text
+          });
+        }
+      });
+      
+      JSON.stringify(events);
+    `;
 
-    console.log('Parsing events from page...');
-    const events = parseEventsFromSnapshot(snapshotOutput);
+    // Escape the code for shell
+    const escapedCode = jsCode.replace(/"/g, '\\"').replace(/\n/g, ' ');
+    const evalCmd = `agent-browser act --eval "${escapedCode}"`;
+    
+    console.log('Running:', evalCmd);
+    let evalOutput;
+    
+    try {
+      evalOutput = execSync(evalCmd, { 
+        encoding: 'utf-8',
+        stdio: 'pipe',
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 30000
+      });
+    } catch (e) {
+      console.log('⚠️  agent-browser eval error:', e.message);
+      evalOutput = e.stdout || '[]';
+    }
+
+    // Parse the output
+    console.log('Raw eval output:', evalOutput.substring(0, 500));
+    
+    let events = [];
+    try {
+      // Extract JSON from the output (it might be wrapped in text)
+      const jsonMatch = evalOutput.match(/\[\s*\{[\s\S]*\}\s*\]/);
+      if (jsonMatch) {
+        events = JSON.parse(jsonMatch[0]);
+      } else if (evalOutput.trim().startsWith('[')) {
+        events = JSON.parse(evalOutput.trim());
+      } else {
+        console.log('Could not find JSON in output');
+      }
+    } catch (e) {
+      console.error('Error parsing JSON:', e.message);
+      events = [];
+    }
 
     console.log(`Found ${events.length} Hockey Drop In events`);
     
     if (events.length === 0) {
-      console.log('⚠️  No events found on page.');
-      console.log('First 1000 chars of snapshot:');
-      console.log(snapshotOutput.substring(0, 1000));
+      console.log('⚠️  No events found. Trying fallback screenshot method...');
+      // Take a screenshot for manual inspection
+      try {
+        execSync('agent-browser act --screenshot screenshot.png', { stdio: 'pipe' });
+        console.log('✓ Screenshot saved to screenshot.png for inspection');
+      } catch (e) {
+        console.log('Could not capture screenshot');
+      }
     }
 
+    // Process and insert events into Supabase
     for (const event of events) {
       const { title, timeText, fullText } = event;
 
       console.log(`Processing: ${title}`);
 
-      // Parse times from text like "6:30am - 7:45am" or "6:30 AM - 7:45 AM"
+      // Parse times from text like "6:30am - 7:45am"
       const timeRegex = /(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)/i;
       const timeMatch = (timeText || fullText).match(timeRegex);
       let startTime, endTime;
@@ -100,7 +181,7 @@ async function scrapeEvents() {
         startTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), start, parseInt(startMin));
         endTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), end, parseInt(endMin));
       } else {
-        console.log(`⚠️  Could not parse time from: "${timeText}" or "${fullText}"`);
+        console.log(`⚠️  Could not parse time from: "${timeText}"`);
         startTime = new Date();
         endTime = new Date(startTime.getTime() + 75 * 60000);
       }
@@ -116,7 +197,6 @@ async function scrapeEvents() {
           console.log('Location lookup error:', locError.message);
         } else {
           locationId = locationData?.id;
-          console.log('Found locationId:', locationId);
         }
       } catch (err) {
         console.log('Location exception:', err.message);
@@ -133,7 +213,6 @@ async function scrapeEvents() {
           console.log('Event type lookup error:', typeError.message);
         } else {
           eventTypeId = eventTypeData?.id;
-          console.log('Found eventTypeId:', eventTypeId);
         }
       } catch (err) {
         console.log('Event type exception:', err.message);
@@ -176,75 +255,6 @@ async function scrapeEvents() {
   } catch (error) {
     console.error('❌ Scrape error:', error.message);
   }
-}
-
-function parseEventsFromSnapshot(text) {
-  const events = [];
-  
-  // Look for any "Drop-in" or "Hockey Drop In" patterns followed by time
-  // Patterns: "Adult Drop-in Player", "Drop-In Goalie", "Hockey Drop In", etc.
-  // Followed by date and time range
-  
-  // More flexible regex to catch various formats
-  const eventRegex = /((?:Adult\s+)?Drop-?in\s+\w+|Hockey\s+Drop\s+In)\s+(\d{1,2}\/\d{1,2}\/\d{2})?.*?(\d{1,2}:\d{2}(?:am|pm)?(?:\s*-\s*\d{1,2}:\d{2}(?:am|pm)?)?)/gi;
-  
-  let match;
-  const seenTitles = new Set();
-  
-  while ((match = eventRegex.exec(text)) !== null) {
-    const [fullMatch, title, date, timeStr] = match;
-    
-    // Normalize title and avoid duplicates
-    const normalizedTitle = title.trim().replace(/\s+/g, ' ');
-    const key = `${normalizedTitle}-${date}`;
-    
-    if (seenTitles.has(key)) continue;
-    seenTitles.add(key);
-    
-    // Clean up time string
-    let timeText = timeStr.trim();
-    // If it's just start time, look ahead for end time
-    if (!timeText.includes('-')) {
-      const nextChars = text.substring(match.index + fullMatch.length, match.index + fullMatch.length + 30);
-      const endTimeMatch = nextChars.match(/(\d{1,2}:\d{2}(?:am|pm)?)/i);
-      if (endTimeMatch) {
-        timeText = `${timeStr.trim()} - ${endTimeMatch[1]}`;
-      }
-    }
-
-    events.push({
-      title: normalizedTitle,
-      date: date || new Date().toLocaleDateString(),
-      timeText: timeText,
-      fullText: `${normalizedTitle} ${date || ''} ${timeText}`.trim()
-    });
-  }
-
-  // If regex didn't find anything, try a simpler pattern
-  if (events.length === 0) {
-    console.log('⚠️  Standard regex found no events, trying alternative patterns...');
-    
-    // Look for time patterns anywhere near drop-in text
-    const lines = text.split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if ((line.includes('drop') || line.includes('Drop') || line.includes('HOCKEY') || line.includes('Hockey')) &&
-          (line.match(/\d{1,2}:\d{2}/))) {
-        
-        // Extract time from this line
-        const timeMatch = line.match(/(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?(?:\s*-\s*\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?)?)/i);
-        if (timeMatch) {
-          events.push({
-            title: line.substring(0, 50).trim(),
-            timeText: timeMatch[0].trim(),
-            fullText: line.trim()
-          });
-        }
-      }
-    }
-  }
-  
-  return events;
 }
 
 scrapeEvents();
