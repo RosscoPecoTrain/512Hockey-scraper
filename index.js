@@ -8,6 +8,12 @@ const path = require('path');
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY environment variables');
+  process.exit(1);
+}
+
 const daysmart_url = 'https://apps.daysmartrecreation.com/dash/x/#/online/chaparralice/calendar';
 const browserMode = process.env.BROWSER_MODE || 'headless';
 const recordVideo = process.env.RECORD_VIDEO === 'true';
@@ -50,9 +56,13 @@ async function scrapeEvents() {
         maxBuffer: 10 * 1024 * 1024
       });
     } catch (e) {
-      console.log('agent-browser output:', e.stdout || e.message);
+      console.log('⚠️  agent-browser error:', e.message);
       snapshotOutput = e.stdout || '';
     }
+
+    // Save snapshot for debugging
+    fs.writeFileSync('snapshot.txt', snapshotOutput);
+    console.log('✓ Snapshot saved to snapshot.txt');
 
     console.log('Parsing events from page...');
     const events = parseEventsFromSnapshot(snapshotOutput);
@@ -60,7 +70,9 @@ async function scrapeEvents() {
     console.log(`Found ${events.length} Hockey Drop In events`);
     
     if (events.length === 0) {
-      console.log('No events found on page.');
+      console.log('⚠️  No events found on page.');
+      console.log('First 1000 chars of snapshot:');
+      console.log(snapshotOutput.substring(0, 1000));
     }
 
     for (const event of events) {
@@ -68,7 +80,9 @@ async function scrapeEvents() {
 
       console.log(`Processing: ${title}`);
 
-      const timeMatch = fullText.match(/(\d{1,2}):(\d{2})(am|pm)\s*-\s*(\d{1,2}):(\d{2})(am|pm)/i);
+      // Parse times from text like "6:30am - 7:45am" or "6:30 AM - 7:45 AM"
+      const timeRegex = /(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)/i;
+      const timeMatch = (timeText || fullText).match(timeRegex);
       let startTime, endTime;
 
       if (timeMatch) {
@@ -86,6 +100,7 @@ async function scrapeEvents() {
         startTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), start, parseInt(startMin));
         endTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), end, parseInt(endMin));
       } else {
+        console.log(`⚠️  Could not parse time from: "${timeText}" or "${fullText}"`);
         startTime = new Date();
         endTime = new Date(startTime.getTime() + 75 * 60000);
       }
@@ -124,69 +139,109 @@ async function scrapeEvents() {
         console.log('Event type exception:', err.message);
       }
 
-      const externalId = `daysmart-${title.replace(/\s+/g, '-')}-${startTime.getTime()}`;
+      // Use title + date as unique ID to avoid duplicates
+      const externalId = `daysmart-${title.replace(/[^a-z0-9]/gi, '_')}-${startTime.toISOString().split('T')[0]}`;
       
-      const { error } = await supabase
-        .from('events')
-        .upsert(
-          {
-            title,
-            description: `${title} at Chaparral Ice`,
-            start_time: startTime.toISOString(),
-            end_time: endTime.toISOString(),
-            location_id: locationId,
-            event_type_id: eventTypeId,
-            registration_url: url,
-            source_url: url,
-            external_event_id: externalId,
-            scraped_at: new Date().toISOString()
-          },
-          { onConflict: 'external_event_id' }
-        );
+      try {
+        const { error } = await supabase
+          .from('events')
+          .upsert(
+            {
+              title,
+              description: `${title} at Chaparral Ice`,
+              start_time: startTime.toISOString(),
+              end_time: endTime.toISOString(),
+              location_id: locationId,
+              event_type_id: eventTypeId,
+              registration_url: url,
+              source_url: url,
+              external_event_id: externalId,
+              scraped_at: new Date().toISOString()
+            },
+            { onConflict: 'external_event_id' }
+          );
 
-      if (error) {
-        console.error(`Error inserting event: ${error.message}`);
-      } else {
-        console.log(`✓ Inserted/updated: ${title}`);
+        if (error) {
+          console.error(`✗ Error inserting event: ${error.message}`);
+        } else {
+          console.log(`✓ Inserted/updated: ${title} (${startTime.toLocaleTimeString()})`);
+        }
+      } catch (err) {
+        console.error(`✗ Exception inserting event: ${err.message}`);
       }
     }
 
     console.log(`[${new Date().toISOString()}] Scrape completed`);
 
   } catch (error) {
-    console.error('Scrape error:', error);
+    console.error('❌ Scrape error:', error.message);
   }
 }
 
 function parseEventsFromSnapshot(text) {
   const events = [];
   
-  // Look for patterns like "Adult Drop-in Player 4/28/26 6:30am"
-  // or "Adult Drop-in Goalie 4/28/26 6:30am" followed by time range
-  const eventRegex = /(Adult\s+Drop-in\s+\w+)\s+(\d{1,2}\/\d{1,2}\/\d{2})\s+(\d{1,2}:\d{2}(?:am|pm)?)/gi;
+  // Look for any "Drop-in" or "Hockey Drop In" patterns followed by time
+  // Patterns: "Adult Drop-in Player", "Drop-In Goalie", "Hockey Drop In", etc.
+  // Followed by date and time range
+  
+  // More flexible regex to catch various formats
+  const eventRegex = /((?:Adult\s+)?Drop-?in\s+\w+|Hockey\s+Drop\s+In)\s+(\d{1,2}\/\d{1,2}\/\d{2})?.*?(\d{1,2}:\d{2}(?:am|pm)?(?:\s*-\s*\d{1,2}:\d{2}(?:am|pm)?)?)/gi;
   
   let match;
+  const seenTitles = new Set();
+  
   while ((match = eventRegex.exec(text)) !== null) {
-    const [fullMatch, title, date, startTimeStr] = match;
+    const [fullMatch, title, date, timeStr] = match;
     
-    // Look ahead in the text for time range (e.g., "6:30am - 7:45am")
-    const nextChars = text.substring(match.index + fullMatch.length, match.index + fullMatch.length + 50);
-    const timeRangeMatch = nextChars.match(/(\d{1,2}:\d{2}(?:am|pm)?)\s*-\s*(\d{1,2}:\d{2}(?:am|pm)?)/i);
+    // Normalize title and avoid duplicates
+    const normalizedTitle = title.trim().replace(/\s+/g, ' ');
+    const key = `${normalizedTitle}-${date}`;
     
-    let timeText = '';
-    if (timeRangeMatch) {
-      timeText = `${timeRangeMatch[1]} - ${timeRangeMatch[2]}`;
-    } else if (startTimeStr) {
-      // If we only have start time, estimate end time (75 min later)
-      timeText = startTimeStr;
+    if (seenTitles.has(key)) continue;
+    seenTitles.add(key);
+    
+    // Clean up time string
+    let timeText = timeStr.trim();
+    // If it's just start time, look ahead for end time
+    if (!timeText.includes('-')) {
+      const nextChars = text.substring(match.index + fullMatch.length, match.index + fullMatch.length + 30);
+      const endTimeMatch = nextChars.match(/(\d{1,2}:\d{2}(?:am|pm)?)/i);
+      if (endTimeMatch) {
+        timeText = `${timeStr.trim()} - ${endTimeMatch[1]}`;
+      }
     }
 
     events.push({
-      title: title.trim(),
-      date: date,
+      title: normalizedTitle,
+      date: date || new Date().toLocaleDateString(),
       timeText: timeText,
-      fullText: `${title.trim()} ${date} ${timeText}`
+      fullText: `${normalizedTitle} ${date || ''} ${timeText}`.trim()
     });
+  }
+
+  // If regex didn't find anything, try a simpler pattern
+  if (events.length === 0) {
+    console.log('⚠️  Standard regex found no events, trying alternative patterns...');
+    
+    // Look for time patterns anywhere near drop-in text
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if ((line.includes('drop') || line.includes('Drop') || line.includes('HOCKEY') || line.includes('Hockey')) &&
+          (line.match(/\d{1,2}:\d{2}/))) {
+        
+        // Extract time from this line
+        const timeMatch = line.match(/(\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?(?:\s*-\s*\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?)?)/i);
+        if (timeMatch) {
+          events.push({
+            title: line.substring(0, 50).trim(),
+            timeText: timeMatch[0].trim(),
+            fullText: line.trim()
+          });
+        }
+      }
+    }
   }
   
   return events;
@@ -199,6 +254,7 @@ cron.schedule('0 */6 * * *', () => {
   scrapeEvents();
 });
 
-console.log('Scraper started. Scheduled to run every 6 hours.');
+console.log('\n🏒 Scraper started. Scheduled to run every 6 hours.');
 console.log(`Browser mode: ${browserMode}`);
 console.log(`Video recording: ${recordVideo ? 'enabled' : 'disabled'}`);
+console.log(`Next scheduled run: 6 hours from startup time.\n`);
