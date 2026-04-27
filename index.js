@@ -1,10 +1,9 @@
 require('dotenv').config();
 
-const { execSync } = require('child_process');
+const puppeteer = require('puppeteer');
 const { createClient } = require('@supabase/supabase-js');
 const cron = require('node-cron');
 const fs = require('fs');
-const path = require('path');
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
@@ -15,149 +14,119 @@ if (!supabaseUrl || !supabaseKey) {
 }
 
 const daysmart_url = 'https://apps.daysmartrecreation.com/dash/x/#/online/chaparralice/calendar';
-const browserMode = process.env.BROWSER_MODE || 'headless';
-const recordVideo = process.env.RECORD_VIDEO === 'true';
+const headlessBrowser = process.env.HEADLESS !== 'false'; // Set to false to see browser
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 async function scrapeEvents() {
   console.log(`[${new Date().toISOString()}] Starting scrape...`);
   
+  let browser;
   try {
+    browser = await puppeteer.launch({
+      headless: headlessBrowser ? 'new' : false,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+
+    const page = await browser.newPage();
+    page.setDefaultTimeout(60000);
+    page.setDefaultNavigationTimeout(60000);
+
+    // Build URL with date range and filters
     const today = new Date().toISOString().split('T')[0];
     const in7days = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
     
+    // event_type=9 for "Hockey Drop In", location=1 for Chaparral Ice
     const url = `${daysmart_url}?start=${today}&end=${in7days}&event_type=9&location=1`;
 
     console.log(`Navigating to: ${url}`);
-    console.log(`Browser mode: ${browserMode}`);
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 });
 
-    // Step 1: Open the page
-    let openCmd = `agent-browser open "${url}"`;
+    // Wait for Angular to render the event list
+    console.log('Waiting for Angular to render...');
+    await page.waitForTimeout(3000); // Extra wait for Angular rendering
     
-    if (browserMode === 'headed') {
-      openCmd += ' --headed';
-    }
-    
-    if (recordVideo) {
-      const videoFile = path.join(process.cwd(), `scrape-${Date.now()}.webm`);
-      openCmd += ` --record "${videoFile}"`;
-      console.log(`Recording video to: ${videoFile}`);
-    }
+    // Try to find event cards - DaySmart uses various selectors
+    await page.waitForSelector('[class*="event"], [role="listitem"], .calendar-event', { timeout: 10000 }).catch(() => {
+      console.log('⚠️  Event selector not found, continuing anyway...');
+    });
 
-    openCmd += ' --wait 3000';
+    // Save the HTML for debugging
+    const html = await page.content();
+    fs.writeFileSync('page.html', html);
+    console.log('✓ Page HTML saved to page.html');
 
-    console.log(`Opening browser...`);
-    try {
-      execSync(openCmd, { 
-        encoding: 'utf-8',
-        stdio: 'pipe',
-        maxBuffer: 10 * 1024 * 1024
-      });
-    } catch (e) {
-      console.log('⚠️  agent-browser open error:', e.message);
-    }
-
-    // Step 2: Extract events using JavaScript evaluation
-    console.log('Extracting events via JavaScript...');
-    
-    const jsCode = `
-      const events = [];
+    // Extract events from the page
+    const events = await page.evaluate(() => {
+      const results = [];
       
-      // Find all event elements - try multiple selectors
+      // Find all event list items - DaySmart uses various class/attribute patterns
       const eventItems = document.querySelectorAll(
-        'div[class*="event"], li[class*="event"], [role="listitem"], .calendar-event, .event-item'
+        'dash-event-list-group-item, .list-group-item--app-item, [class*="event"], [role="listitem"], .calendar-event'
       );
-      
-      console.log('Found ' + eventItems.length + ' potential event items');
-      
+      console.log(`Found ${eventItems.length} potential event items`);
+
       eventItems.forEach((item) => {
         const text = item.textContent || '';
         
-        // Look for drop-in hockey events
-        if (!text.match(/drop.?in|hockey/i)) return;
-        
-        // Extract title
+        // Only capture "Hockey Drop In" / "Drop-in Player" events
+        if (!text.includes('Drop-in') && !text.includes('Hockey Drop In') && !text.includes('Adult Drop-In')) return;
+
+        // Extract title - look for it in various places
         let title = '';
-        const titleEl = item.querySelector('strong, b, h3, h4, a');
-        if (titleEl) {
-          title = titleEl.textContent.trim();
+        const titleLink = item.querySelector('a[href*="/teams/"], a[href*="online/"]');
+        if (titleLink) {
+          title = titleLink.textContent.trim();
         } else {
-          title = text.split('\\n')[0].trim();
+          // Fallback: get first line or bold text
+          const bold = item.querySelector('strong, b, h3, h4');
+          if (bold) {
+            title = bold.textContent.trim();
+          } else {
+            // Last resort: first non-empty line of text
+            title = text.split('\n')[0].trim();
+          }
         }
         
-        // Extract time (e.g., "6:30 AM - 7:45 AM")
-        const timeMatch = text.match(/(\\d{1,2}):(\\d{2})\\s*(am|pm|AM|PM)\\s*-\\s*(\\d{1,2}):(\\d{2})\\s*(am|pm|AM|PM)/i);
-        if (!timeMatch) return; // Skip if no time found
+        // Extract time (e.g., "6:30am - 7:45am" or "6:30 AM - 7:45 AM")
+        const timeRegex = /(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(am|pm|AM|PM)/i;
+        const timeMatch = text.match(timeRegex);
+        const timeText = timeMatch ? timeMatch[0] : '';
         
-        const timeText = timeMatch[0];
-        
-        if (title && title.length > 3) {
-          events.push({
-            title: title,
-            timeText: timeText,
+        // Extract location (usually "Chaparral Ice" or similar)
+        const locationText = 'Chaparral Ice'; // We know it's from the calendar URL
+
+        // Only add if we have a title and time
+        if (title && title.length > 3 && timeText) {
+          results.push({
+            title,
+            timeText,
+            locationText,
             fullText: text
           });
         }
       });
-      
-      JSON.stringify(events);
-    `;
 
-    // Escape the code for shell
-    const escapedCode = jsCode.replace(/"/g, '\\"').replace(/\n/g, ' ');
-    const evalCmd = `agent-browser act --eval "${escapedCode}"`;
-    
-    console.log('Running:', evalCmd);
-    let evalOutput;
-    
-    try {
-      evalOutput = execSync(evalCmd, { 
-        encoding: 'utf-8',
-        stdio: 'pipe',
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 30000
-      });
-    } catch (e) {
-      console.log('⚠️  agent-browser eval error:', e.message);
-      evalOutput = e.stdout || '[]';
-    }
-
-    // Parse the output
-    console.log('Raw eval output:', evalOutput.substring(0, 500));
-    
-    let events = [];
-    try {
-      // Extract JSON from the output (it might be wrapped in text)
-      const jsonMatch = evalOutput.match(/\[\s*\{[\s\S]*\}\s*\]/);
-      if (jsonMatch) {
-        events = JSON.parse(jsonMatch[0]);
-      } else if (evalOutput.trim().startsWith('[')) {
-        events = JSON.parse(evalOutput.trim());
-      } else {
-        console.log('Could not find JSON in output');
-      }
-    } catch (e) {
-      console.error('Error parsing JSON:', e.message);
-      events = [];
-    }
+      console.log(`Extracted ${results.length} events`);
+      return results;
+    });
 
     console.log(`Found ${events.length} Hockey Drop In events`);
     
     if (events.length === 0) {
-      console.log('⚠️  No events found. Trying fallback screenshot method...');
-      // Take a screenshot for manual inspection
-      try {
-        execSync('agent-browser act --screenshot screenshot.png', { stdio: 'pipe' });
-        console.log('✓ Screenshot saved to screenshot.png for inspection');
-      } catch (e) {
-        console.log('Could not capture screenshot');
-      }
+      console.log('⚠️  No events found. Dumping page structure for debugging...');
+      const pageText = await page.evaluate(() => {
+        const body = document.body.innerText;
+        // Log more content to help debug selector issues
+        const allText = body.substring(0, 2000);
+        return allText;
+      });
+      console.log(pageText);
     }
 
     // Process and insert events into Supabase
     for (const event of events) {
-      const { title, timeText, fullText } = event;
+      const { title, timeText, locationText, fullText } = event;
 
       console.log(`Processing: ${title}`);
 
@@ -181,11 +150,12 @@ async function scrapeEvents() {
         startTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), start, parseInt(startMin));
         endTime = new Date(today.getFullYear(), today.getMonth(), today.getDate(), end, parseInt(endMin));
       } else {
-        console.log(`⚠️  Could not parse time from: "${timeText}"`);
+        console.log(`⚠️  Could not parse time from: "${timeText}" or "${fullText}"`);
         startTime = new Date();
-        endTime = new Date(startTime.getTime() + 75 * 60000);
+        endTime = new Date(startTime.getTime() + 75 * 60000); // Default 75 min based on typical drop-in time
       }
 
+      // Find location_id in Supabase
       let locationId = null;
       try {
         const { data: locationData, error: locError } = await supabase
@@ -197,11 +167,13 @@ async function scrapeEvents() {
           console.log('Location lookup error:', locError.message);
         } else {
           locationId = locationData?.id;
+          console.log('Found locationId:', locationId);
         }
       } catch (err) {
         console.log('Location exception:', err.message);
       }
 
+      // Find event_type_id
       let eventTypeId = null;
       try {
         const { data: eventTypeData, error: typeError } = await supabase
@@ -213,11 +185,13 @@ async function scrapeEvents() {
           console.log('Event type lookup error:', typeError.message);
         } else {
           eventTypeId = eventTypeData?.id;
+          console.log('Found eventTypeId:', eventTypeId);
         }
       } catch (err) {
         console.log('Event type exception:', err.message);
       }
 
+      // Upsert event
       // Use title + date as unique ID to avoid duplicates
       const externalId = `daysmart-${title.replace(/[^a-z0-9]/gi, '_')}-${startTime.toISOString().split('T')[0]}`;
       
@@ -250,21 +224,24 @@ async function scrapeEvents() {
       }
     }
 
+    await browser.close();
     console.log(`[${new Date().toISOString()}] Scrape completed`);
 
   } catch (error) {
     console.error('❌ Scrape error:', error.message);
+    if (browser) await browser.close();
   }
 }
 
+// Run immediately on startup
 scrapeEvents();
 
+// Schedule to run every 6 hours
 cron.schedule('0 */6 * * *', () => {
   console.log('Cron triggered, starting scrape...');
   scrapeEvents();
 });
 
 console.log('\n🏒 Scraper started. Scheduled to run every 6 hours.');
-console.log(`Browser mode: ${browserMode}`);
-console.log(`Video recording: ${recordVideo ? 'enabled' : 'disabled'}`);
+console.log(`Browser mode: ${headlessBrowser ? 'headless (hidden)' : 'visible (you can see it)'}`);
 console.log(`Next scheduled run: 6 hours from startup time.\n`);
