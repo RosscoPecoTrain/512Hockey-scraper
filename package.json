@@ -9,7 +9,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.38.4",
     "dotenv": "^17.4.2",
-    "node-cron": "^3.0.2",
-    "puppeteer": "^21.6.0"
+    "node-cron": "^4.2.1",
+    "puppeteer": "^24.42.0"
   }
 }
