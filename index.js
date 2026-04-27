@@ -44,7 +44,7 @@ async function scrapeEvents() {
 
     // Wait for Angular to render the event list
     console.log('Waiting for Angular to render...');
-    await page.waitForTimeout(3000); // Extra wait for Angular rendering
+    await new Promise(resolve => setTimeout(resolve, 3000)); // Extra wait for Angular rendering
     
     // Try to find event cards - DaySmart uses various selectors
     await page.waitForSelector('[class*="event"], [role="listitem"], .calendar-event', { timeout: 10000 }).catch(() => {
